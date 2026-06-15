@@ -13,6 +13,8 @@ use crate::{
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, StreamExt};
 use native_tls::TlsConnector;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
 
 use super::Client;
@@ -248,6 +250,45 @@ impl ClientBuilder {
                 }
                 // NOTE: Although self.url contains the sid, it does not propagate to the transport
                 // SAFETY: handshake function called previously.
+                Ok(Client::new(InnerSocket::new(
+                    transport.into(),
+                    self.handshake.unwrap(),
+                    self.on_close,
+                    self.on_data,
+                    self.on_error,
+                    self.on_open,
+                    self.on_packet,
+                )))
+            }
+            _ => Err(Error::InvalidUrlScheme(self.url.scheme().to_string())),
+        }
+    }
+
+    /// Build socket with an already connected websocket transport.
+    pub async fn build_websocket_with_stream(
+        mut self,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Result<Client> {
+        match self.url.scheme() {
+            "http" | "ws" => {
+                let mut transport =
+                    WebsocketTransport::from_websocket_stream(self.url.clone(), stream).await?;
+                self.handshake_with_transport(&mut transport).await?;
+                Ok(Client::new(InnerSocket::new(
+                    transport.into(),
+                    self.handshake.unwrap(),
+                    self.on_close,
+                    self.on_data,
+                    self.on_error,
+                    self.on_open,
+                    self.on_packet,
+                )))
+            }
+            "https" | "wss" => {
+                let mut transport =
+                    WebsocketSecureTransport::from_websocket_stream(self.url.clone(), stream)
+                        .await?;
+                self.handshake_with_transport(&mut transport).await?;
                 Ok(Client::new(InnerSocket::new(
                     transport.into(),
                     self.handshake.unwrap(),

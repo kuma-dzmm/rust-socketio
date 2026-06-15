@@ -2,13 +2,17 @@ use futures_util::future::BoxFuture;
 use log::trace;
 use native_tls::TlsConnector;
 use rust_engineio::{
-    asynchronous::ClientBuilder as EngineIoClientBuilder,
+    ENGINE_IO_VERSION, asynchronous::ClientBuilder as EngineIoClientBuilder,
     header::{HeaderMap, HeaderValue},
 };
 use std::collections::HashMap;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, tungstenite, tungstenite::client::IntoClientRequest,
+};
 use url::Url;
 
-use crate::{error::Result, Event, Payload, TransportType};
+use crate::{Error, Event, Payload, TransportType, error::Result};
 
 use super::{
     callback::{
@@ -430,13 +434,50 @@ impl ClientBuilder {
         Ok(socket)
     }
 
+    /// Returns the Socket.IO websocket opening request without opening the TCP connection.
+    pub fn websocket_request(&self) -> Result<tungstenite::http::Request<()>> {
+        let mut url = self.engine_io_url()?;
+        url.query_pairs_mut()
+            .append_pair("EIO", &ENGINE_IO_VERSION.to_string())
+            .append_pair("transport", "websocket");
+        match url.scheme() {
+            "http" => {
+                url.set_scheme("ws")
+                    .map_err(|_| Error::InvalidUrlScheme("http".to_string()))?;
+            }
+            "https" => {
+                url.set_scheme("wss")
+                    .map_err(|_| Error::InvalidUrlScheme("https".to_string()))?;
+            }
+            "ws" | "wss" => {}
+            other => return Err(Error::InvalidUrlScheme(other.to_string())),
+        }
+
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|err| Error::InvalidHandshake(err.to_string()))?;
+        if let Some(headers) = &self.opening_headers {
+            let headers: tungstenite::http::HeaderMap = headers.to_owned().try_into()?;
+            request.headers_mut().extend(headers);
+        }
+        Ok(request)
+    }
+
+    /// Connects using an already opened websocket stream.
+    pub async fn connect_with_websocket_stream(
+        self,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Result<Client> {
+        let mut socket = self.connect_manual_with_websocket_stream(stream).await?;
+        socket.poll_stream().await?;
+
+        Ok(socket)
+    }
+
     /// Creates a new Socket that can be used for reconnections
     pub(crate) async fn inner_create(&self) -> Result<InnerSocket> {
-        let mut url = Url::parse(&self.address)?;
-
-        if url.path() == "/" {
-            url.set_path("/socket.io/");
-        }
+        let url = self.engine_io_url()?;
 
         let mut builder = EngineIoClientBuilder::new(url);
 
@@ -458,9 +499,50 @@ impl ClientBuilder {
         Ok(inner_socket)
     }
 
+    pub(crate) async fn inner_create_with_websocket_stream(
+        &self,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Result<InnerSocket> {
+        let url = self.engine_io_url()?;
+
+        let mut builder = EngineIoClientBuilder::new(url);
+        if let Some(tls_config) = &self.tls_config {
+            builder = builder.tls_config(tls_config.to_owned());
+        }
+        if let Some(headers) = &self.opening_headers {
+            builder = builder.headers(headers.to_owned());
+        }
+
+        let engine_client = builder.build_websocket_with_stream(stream).await?;
+        let inner_socket = InnerSocket::new(engine_client)?;
+        Ok(inner_socket)
+    }
+
+    fn engine_io_url(&self) -> Result<Url> {
+        let mut url = Url::parse(&self.address)?;
+
+        if url.path() == "/" {
+            url.set_path("/socket.io/");
+        }
+
+        Ok(url)
+    }
+
     //TODO: 0.3.X stabilize
     pub(crate) async fn connect_manual(self) -> Result<Client> {
         let inner_socket = self.inner_create().await?;
+
+        let socket = Client::new(inner_socket, self)?;
+        socket.connect().await?;
+
+        Ok(socket)
+    }
+
+    pub(crate) async fn connect_manual_with_websocket_stream(
+        self,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Result<Client> {
+        let inner_socket = self.inner_create_with_websocket_stream(stream).await?;
 
         let socket = Client::new(inner_socket, self)?;
         socket.connect().await?;

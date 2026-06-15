@@ -9,8 +9,9 @@ use bytes::Bytes;
 use futures_util::stream::StreamExt;
 use futures_util::Stream;
 use http::HeaderMap;
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tungstenite::client::IntoClientRequest;
 use url::Url;
 
@@ -28,24 +29,40 @@ pub struct WebsocketTransport {
 impl WebsocketTransport {
     /// Creates a new instance over a request that might hold additional headers and an URL.
     pub async fn new(base_url: Url, headers: Option<HeaderMap>) -> Result<Self> {
-        let mut url = base_url;
-        url.query_pairs_mut().append_pair("transport", "websocket");
-        url.set_scheme("ws").unwrap();
-
-        let mut req = url.clone().into_client_request()?;
+        let url = Self::websocket_url(base_url);
+        let mut req = url.as_str().into_client_request()?;
         if let Some(map) = headers {
             // SAFETY: this unwrap never panics as the underlying request is just initialized and in proper state
             req.headers_mut().extend(map);
         }
 
         let (ws_stream, _) = connect_async(req).await?;
-        let (sen, rec) = ws_stream.split();
+        Self::from_prepared_websocket_stream(url, ws_stream).await
+    }
 
-        let inner = AsyncWebsocketGeneralTransport::new(sen, rec).await;
+    pub(crate) async fn from_websocket_stream(
+        base_url: Url,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Result<Self> {
+        let url = Self::websocket_url(base_url);
+        Self::from_prepared_websocket_stream(url, stream).await
+    }
+
+    async fn from_prepared_websocket_stream(
+        url: Url,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Result<Self> {
+        let inner = AsyncWebsocketGeneralTransport::from_stream(stream).await;
         Ok(WebsocketTransport {
             inner,
             base_url: Arc::new(RwLock::new(url)),
         })
+    }
+
+    fn websocket_url(mut base_url: Url) -> Url {
+        base_url.query_pairs_mut().append_pair("transport", "websocket");
+        base_url.set_scheme("ws").unwrap();
+        base_url
     }
 
     /// Sends probe packet to ensure connection is valid, then sends upgrade

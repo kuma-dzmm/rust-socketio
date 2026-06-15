@@ -1,4 +1,4 @@
-use std::{borrow::Cow, str::from_utf8, sync::Arc, task::Poll};
+use std::{str::from_utf8, sync::Arc, task::Poll};
 
 use crate::{error::Result, Error, Packet, PacketId};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -35,17 +35,19 @@ impl AsyncWebsocketGeneralTransport {
         }
     }
 
+    pub(crate) async fn from_stream(stream: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        let (sender, receiver) = stream.split();
+        Self::new(sender, receiver).await
+    }
+
     /// Sends probe packet to ensure connection is valid, then sends upgrade
     /// request
     pub(crate) async fn upgrade(&self) -> Result<()> {
         let mut receiver = self.receiver.lock().await;
         let mut sender = self.sender.lock().await;
 
-        sender
-            .send(Message::text(Cow::Borrowed(from_utf8(&Bytes::from(
-                Packet::new(PacketId::Ping, Bytes::from("probe")),
-            ))?)))
-            .await?;
+        let ping = Bytes::from(Packet::new(PacketId::Ping, Bytes::from("probe")));
+        sender.send(Message::text(from_utf8(&ping)?.to_owned())).await?;
 
         let msg = receiver
             .next()
@@ -56,10 +58,9 @@ impl AsyncWebsocketGeneralTransport {
             return Err(Error::InvalidPacket());
         }
 
+        let upgrade = Bytes::from(Packet::new(PacketId::Upgrade, Bytes::from("")));
         sender
-            .send(Message::text(Cow::Borrowed(from_utf8(&Bytes::from(
-                Packet::new(PacketId::Upgrade, Bytes::from("")),
-            ))?)))
+            .send(Message::text(from_utf8(&upgrade)?.to_owned()))
             .await?;
 
         Ok(())
@@ -69,9 +70,9 @@ impl AsyncWebsocketGeneralTransport {
         let mut sender = self.sender.lock().await;
 
         let message = if is_binary_att {
-            Message::binary(Cow::Borrowed(data.as_ref()))
+            Message::binary(data)
         } else {
-            Message::text(Cow::Borrowed(std::str::from_utf8(data.as_ref())?))
+            Message::text(std::str::from_utf8(data.as_ref())?.to_owned())
         };
 
         sender.send(message).await?;
